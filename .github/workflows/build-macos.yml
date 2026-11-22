@@ -1,99 +1,134 @@
-name: SeekYe macOS ARM64
+name: SeekYe tagged desktop releases
 
 on:
   push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
-  workflow_dispatch:
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
 
 jobs:
   macos-arm64:
+    name: Build macOS ARM64
     runs-on: macos-15
-    permissions:
-      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-
-      - name: Set up Rust ARM64 target
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
-
-      - name: Cache Rust build
-        uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
-
-      - name: Check runner architecture
+      - name: Verify architecture
         shell: bash
-        run: |
-          echo "Runner architecture: $(uname -m)"
-          test "$(uname -m)" = arm64
-
+        run: test "$(uname -m)" = arm64
       - name: Install dependencies
         run: bun install --frozen-lockfile
-
       - name: Run tests
         run: bun run test
-
-      - name: Build SeekYe macOS ARM64 app and DMG
-        run: bun run desktop:build
-
-      - name: Collect application and binary artifacts
+      - name: Build macOS ARM64 bundles
+        run: bun run tauri build --target aarch64-apple-darwin --bundles dmg
+      - name: Collect macOS deliverables
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          echo 'Tauri bundle candidates:'
-          find src-tauri/target -type d -name '*.app' -print || true
-          find src-tauri/target -type f -name '*.dmg' -print || true
-
-          APP="$(find src-tauri/target -type d -name 'SeekYe.app' -print -quit)"
-          test -n "$APP" || { echo 'ERROR: SeekYe.app not found'; exit 1; }
-          test -f "$APP/Contents/MacOS/seekye" || { echo 'ERROR: app executable missing'; exit 1; }
-
-          # ditto preserves macOS bundle structure and executable permissions.
+          TARGET=src-tauri/target/aarch64-apple-darwin/release
+          APP="$TARGET/bundle/macos/SeekYe.app"
+          BIN="$APP/Contents/MacOS/seekye"
+          test -d "$APP" && test -f "$BIN"
           ditto -c -k --sequesterRsrc --keepParent "$APP" dist/SeekYe-macOS-arm64.app.zip
-          cp "$APP/Contents/MacOS/seekye" dist/seekye-macos-arm64
+          cp "$BIN" dist/seekye-macos-arm64
           chmod +x dist/seekye-macos-arm64
-
-          DMG="$(find src-tauri/target -type f -name '*.dmg' -print -quit)"
-          test -n "$DMG" || { echo 'ERROR: DMG not found'; exit 1; }
-          cp "$DMG" dist/SeekYe-macOS-arm64.dmg
-
-          shasum -a 256 dist/* > dist/SHA256SUMS.txt
-          echo 'Prepared artifacts:'
-          ls -lh dist/
-          file dist/seekye-macos-arm64
-
-      - name: Upload macOS ARM64 artifacts
-        uses: actions/upload-artifact@v4
+          find "$TARGET/bundle/dmg" -maxdepth 1 -type f -name '*.dmg' -print -exec cp {} dist/SeekYe-macOS-arm64.dmg \;
+          test -s dist/SeekYe-macOS-arm64.dmg
+          (cd dist && shasum -a 256 SeekYe-macOS-arm64.app.zip seekye-macos-arm64 SeekYe-macOS-arm64.dmg > SHA256SUMS-macOS.txt)
+          ls -lh dist
+      - uses: actions/upload-artifact@v4
         with:
-          name: SeekYe-macOS-arm64
+          name: seekye-macos-arm64
           path: dist/*
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish tagged GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+  windows-x64:
+    name: Build Windows x64
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Run tests
+        run: bun run test
+      - name: Build Windows x64 NSIS installer
+        run: bun run tauri build --target x86_64-pc-windows-msvc --bundles nsis
+      - name: Collect Windows deliverables
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $target = 'src-tauri/target/x86_64-pc-windows-msvc/release'
+          $binary = Join-Path $target 'seekye.exe'
+          if (!(Test-Path $binary)) { throw "Missing Windows executable: $binary" }
+          Copy-Item $binary 'dist/SeekYe-Windows-x64-portable.exe'
+          $installers = @(Get-ChildItem (Join-Path $target 'bundle/nsis') -Filter '*-setup.exe' -File)
+          if ($installers.Count -ne 1) { throw "Expected one NSIS installer, found $($installers.Count)" }
+          Copy-Item $installers[0].FullName 'dist/SeekYe-Windows-x64-Setup.exe'
+          Get-ChildItem dist -File | Sort-Object Name | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
+            Set-Content 'dist/SHA256SUMS-Windows.txt'
+          Get-ChildItem dist | Format-Table Name, Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seekye-windows-x64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-release:
+    name: Publish public GitHub Release
+    needs: [macos-arm64, windows-x64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: seekye-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify all release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in SeekYe-macOS-arm64.dmg SeekYe-macOS-arm64.app.zip seekye-macos-arm64 SeekYe-Windows-x64-Setup.exe SeekYe-Windows-x64-portable.exe SHA256SUMS-macOS.txt SHA256SUMS-Windows.txt; do
+            test -s "release-assets/$name" || { echo "Missing $name"; exit 1; }
+          done
+          ls -lah release-assets
+      - name: Publish tagged release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
           else
-            gh release create "$GITHUB_REF_NAME" dist/* \
-              --generate-notes --title "SeekYe $GITHUB_REF_NAME"
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --title "SeekYe $GITHUB_REF_NAME" \
+              --generate-notes --latest
           fi
