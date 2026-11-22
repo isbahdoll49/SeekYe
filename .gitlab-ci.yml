@@ -1,0 +1,16 @@
+stages: [build]
+# Requires your own Apple Silicon macOS runner tagged macos-arm64.
+macos_arm64:
+  stage: build
+  tags: [macos-arm64]
+  script:
+    - rustup target add aarch64-apple-darwin
+    - npm install --no-audit --no-fund
+    - npm test
+    - npm run desktop:build
+  artifacts:
+    name: "SeekYe-macOS-arm64-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/
+      - src-tauri/target/aarch64-apple-darwin/release/bundle/macos/
+    expire_in: 30 days
