@@ -31,16 +31,22 @@ jobs:
       - name: Run tests
         run: bun run test
       - name: Build macOS ARM64 bundles
-        run: bun run tauri build --target aarch64-apple-darwin --bundles dmg
+        run: bun run tauri build --target aarch64-apple-darwin --bundles app,dmg
       - name: Collect macOS deliverables
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
           TARGET=src-tauri/target/aarch64-apple-darwin/release
-          APP="$TARGET/bundle/macos/SeekYe.app"
+          echo "Bundle output:"
+          find "$TARGET" -maxdepth 5 \( -name '*.app' -o -name '*.dmg' -o -name 'seekye' \) -print || true
+          APP="$(find "$TARGET/bundle/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [ -z "$APP" ]; then
+            echo 'Missing macOS .app bundle. Ensure --bundles app,dmg is set.' >&2
+            exit 1
+          fi
           BIN="$APP/Contents/MacOS/seekye"
-          test -d "$APP" && test -f "$BIN"
+          test -f "$BIN" || { echo "Missing executable: $BIN" >&2; exit 1; }
           ditto -c -k --sequesterRsrc --keepParent "$APP" dist/SeekYe-macOS-arm64.app.zip
           cp "$BIN" dist/seekye-macos-arm64
           chmod +x dist/seekye-macos-arm64
@@ -73,6 +79,19 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Run tests
         run: bun run test
+      - name: Ensure Windows icon exists
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $icon = 'src-tauri/icons/icon.ico'
+          if (!(Test-Path $icon)) {
+            Write-Host 'icon.ico missing from checkout. Generating from icon.png.'
+            if (!(Test-Path 'src-tauri/icons/icon.png')) { throw 'Missing src-tauri/icons/icon.png' }
+            python -m pip install --disable-pip-version-check Pillow
+            python -c "from PIL import Image; im = Image.open('src-tauri/icons/icon.png').convert('RGBA'); im.save('src-tauri/icons/icon.ico', format='ICO', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+          }
+          if (!(Test-Path $icon)) { throw "Windows icon still missing: $icon" }
+          Get-Item $icon | Select-Object FullName, Length
       - name: Build Windows x64 NSIS installer
         run: bun run tauri build --target x86_64-pc-windows-msvc --bundles nsis
       - name: Collect Windows deliverables
@@ -82,9 +101,12 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           $target = 'src-tauri/target/x86_64-pc-windows-msvc/release'
           $binary = Join-Path $target 'seekye.exe'
-          if (!(Test-Path $binary)) { throw "Missing Windows executable: $binary" }
+          if (!(Test-Path $binary)) {
+            Get-ChildItem 'src-tauri/target' -Recurse -Filter '*.exe' | Select-Object -ExpandProperty FullName
+            throw "Missing Windows executable: $binary"
+          }
           Copy-Item $binary 'dist/SeekYe-Windows-x64-portable.exe'
-          $installers = @(Get-ChildItem (Join-Path $target 'bundle/nsis') -Filter '*-setup.exe' -File)
+          $installers = @(Get-ChildItem (Join-Path $target 'bundle/nsis') -Filter '*.exe' -File)
           if ($installers.Count -ne 1) { throw "Expected one NSIS installer, found $($installers.Count)" }
           Copy-Item $installers[0].FullName 'dist/SeekYe-Windows-x64-Setup.exe'
           Get-ChildItem dist -File | Sort-Object Name | Get-FileHash -Algorithm SHA256 |
