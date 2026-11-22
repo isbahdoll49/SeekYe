@@ -94,7 +94,7 @@ jobs:
           Get-Item $icon | Select-Object FullName, Length
       - name: Build Windows x64 NSIS installer
         run: bun run tauri build --target x86_64-pc-windows-msvc --bundles nsis
-      - name: Collect Windows deliverables
+      - name: Validate and package Windows x64 binaries
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -103,16 +103,59 @@ jobs:
           $binary = Join-Path $target 'seekye.exe'
           if (!(Test-Path $binary)) {
             Get-ChildItem 'src-tauri/target' -Recurse -Filter '*.exe' | Select-Object -ExpandProperty FullName
-            throw "Missing Windows executable: $binary"
+            throw "Missing Windows application executable: $binary"
           }
+
+          # A successful Cargo build is not sufficient: verify that the output
+          # is actually a 64-bit Windows executable before publishing it.
+          function Assert-WindowsX64PE([string] $path) {
+            $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $path).Path)
+            if ($bytes.Length -lt 1024) { throw "Executable too small: $path" }
+            if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+              throw "Not a Windows PE executable (missing MZ): $path"
+            }
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+            if ($peOffset -lt 0x40 -or ($peOffset + 26) -ge $bytes.Length) {
+              throw "Invalid PE offset: $path"
+            }
+            if ($bytes[$peOffset] -ne 0x50 -or $bytes[$peOffset+1] -ne 0x45 -or
+                $bytes[$peOffset+2] -ne 0 -or $bytes[$peOffset+3] -ne 0) {
+              throw "Missing PE signature: $path"
+            }
+            $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+            $optionalMagic = [BitConverter]::ToUInt16($bytes, $peOffset + 24)
+            if ($machine -ne 0x8664 -or $optionalMagic -ne 0x20B) {
+              throw ('Expected PE32+ AMD64, got machine=0x{0:X4} magic=0x{1:X4}: {2}' -f $machine, $optionalMagic, $path)
+            }
+            Write-Host "Verified Windows PE32+ AMD64: $path ($($bytes.Length) bytes)"
+          }
+
+          Assert-WindowsX64PE $binary
           Copy-Item $binary 'dist/SeekYe-Windows-x64-portable.exe'
-          $installers = @(Get-ChildItem (Join-Path $target 'bundle/nsis') -Filter '*.exe' -File)
+          Assert-WindowsX64PE 'dist/SeekYe-Windows-x64-portable.exe'
+
+          $nsisPath = Join-Path $target 'bundle/nsis'
+          if (!(Test-Path $nsisPath)) { throw "NSIS output folder missing: $nsisPath" }
+          $installers = @(Get-ChildItem $nsisPath -Filter '*.exe' -File)
           if ($installers.Count -ne 1) { throw "Expected one NSIS installer, found $($installers.Count)" }
+          # NSIS installers can use a 32-bit bootstrapper even when the app is x64.
+          # Only the application executable must be PE32+ AMD64.
           Copy-Item $installers[0].FullName 'dist/SeekYe-Windows-x64-Setup.exe'
-          Get-ChildItem dist -File | Sort-Object Name | Get-FileHash -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
-            Set-Content 'dist/SHA256SUMS-Windows.txt'
-          Get-ChildItem dist | Format-Table Name, Length
+
+          # ZIP avoids ambiguous direct-EXE handling by download managers and
+          # enables a clean extraction before launching.
+          Compress-Archive -Path 'dist/SeekYe-Windows-x64-portable.exe' -DestinationPath 'dist/SeekYe-Windows-x64-portable.zip' -Force
+
+          $releaseFiles = @(
+            'dist/SeekYe-Windows-x64-portable.exe',
+            'dist/SeekYe-Windows-x64-portable.zip',
+            'dist/SeekYe-Windows-x64-Setup.exe'
+          )
+          $releaseFiles | ForEach-Object {
+            $hash = Get-FileHash -Path $_ -Algorithm SHA256
+            "$($hash.Hash.ToLower())  $(Split-Path $_ -Leaf)"
+          } | Set-Content 'dist/SHA256SUMS-Windows.txt'
+          Get-ChildItem dist -File | Format-Table Name, Length
       - uses: actions/upload-artifact@v4
         with:
           name: seekye-windows-x64
@@ -136,7 +179,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for name in SeekYe-macOS-arm64.dmg SeekYe-macOS-arm64.app.zip seekye-macos-arm64 SeekYe-Windows-x64-Setup.exe SeekYe-Windows-x64-portable.exe SHA256SUMS-macOS.txt SHA256SUMS-Windows.txt; do
+          for name in SeekYe-macOS-arm64.dmg SeekYe-macOS-arm64.app.zip seekye-macos-arm64 SeekYe-Windows-x64-Setup.exe SeekYe-Windows-x64-portable.exe SeekYe-Windows-x64-portable.zip SHA256SUMS-macOS.txt SHA256SUMS-Windows.txt; do
             test -s "release-assets/$name" || { echo "Missing $name"; exit 1; }
           done
           ls -lah release-assets
