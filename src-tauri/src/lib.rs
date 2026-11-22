@@ -1,7 +1,7 @@
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 #[tauri::command]
-fn search_images(app: tauri::AppHandle, query: String) -> Result<(), String> {
+async fn search_images(app: tauri::AppHandle, query: String) -> Result<(), String> {
     let query = query.trim().to_owned();
     if query.is_empty() || query.chars().count() > 300 {
         return Err("Query must be between 1 and 300 characters".into());
@@ -12,6 +12,7 @@ fn search_images(app: tauri::AppHandle, query: String) -> Result<(), String> {
     }
 
     let automation_query = query.clone();
+    let _ = app.emit("seekye:status", "Opening Yandex in the native browser...");
     let events_app = app.clone();
     WebviewWindowBuilder::new(
         &app,
@@ -29,12 +30,19 @@ fn search_images(app: tauri::AppHandle, query: String) -> Result<(), String> {
             }
             return false;
         }
-        // Never grant this remote browser window Tauri command capabilities.
-        url.scheme() == "https"
-            && url.host_str().map(|host| host == "ya.ru" || host.ends_with(".ya.ru") || host == "yandex.ru" || host.ends_with(".yandex.ru") || host == "yandex.com" || host.ends_with(".yandex.com")).unwrap_or(false)
+        // WebView2 starts at about:blank on Windows. Blocking that navigation can
+        // leave a white browser window before the requested URL loads.
+        // Remote pages never receive Tauri IPC capabilities (only `main` does).
+        // Allow HTTPS redirects, including regional Yandex domains and consent
+        // pages; the separate browser is intentionally an interactive browser.
+        matches!(url.scheme(), "https" | "http")
+            || (url.scheme() == "about" && url.path() == "blank")
     })
     .on_page_load(move |window, payload| {
-        if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+        let current_url = payload.url().to_string();
+        let _ = window.app_handle().emit("seekye:status", format!("Browser loaded: {current_url}"));
+        if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
+            || !matches!(payload.url().scheme(), "http" | "https") {
             return;
         }
         let query_js = match serde_json::to_string(&automation_query) {
@@ -42,7 +50,9 @@ fn search_images(app: tauri::AppHandle, query: String) -> Result<(), String> {
             Err(_) => return,
         };
         let script = include_str!("automation.js").replace("__SEEKYE_QUERY_JSON__", &query_js);
-        let _ = window.eval(script);
+        if let Err(error) = window.eval(script) {
+            let _ = window.app_handle().emit("seekye:status", format!("Automation injection failed: {error}"));
+        }
     })
     .build()
     .map_err(|e| e.to_string())?;
